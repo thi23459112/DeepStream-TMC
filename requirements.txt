@@ -1,0 +1,11 @@
+gdown
+ftfy
+regex
+loguru
+lapx
+requests
+urllib3
+fastapi
+uvicorn
+pydantic
+pyodbc
