@@ -41,7 +41,7 @@ MAX_RETRIES = 2
 
 # ⭐ Log 檔名。為避免和「背景舊程式」搶同一個檔（造成權限不足或互相覆蓋），
 #    測試期間建議用不同檔名；正式切換、舊程式停掉後再改回 PutAPI_run.log 也行。
-LOG_FILENAME = "PutAPI_run_new.log"
+LOG_FILENAME = "PutAPI_run_old.log"
 
 
 # 自訂的由新至舊寫入 Handler
