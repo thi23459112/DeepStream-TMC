@@ -45,7 +45,8 @@ from typing import List, Dict, Any, Tuple
 
 # 自動偵測專案根目錄 (本檔位於 <project_root>/traffic_count_txt.py)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-YAML_DIR = f"{BASE_DIR}/ds_yaml"
+# YAML_DIR = f"{BASE_DIR}/ds_yaml"
+YAML_DIR = os.environ.get("DS_YAML_DIR", f"{BASE_DIR}/ds_yaml")
 
 # --- 標籤檔（位於 BASE_DIR 下） ---
 CAR_LABEL_FILE = "labels_car.txt"
