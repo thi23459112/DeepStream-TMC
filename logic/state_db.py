@@ -259,7 +259,6 @@ def _finalize_one(m_key, state, force=False):
     local_id = get_local_id(pad_index, obj_id)
     device_code = cfg.get("device_code", "UNKNOWN")
     path_str = ">".join(ordered)        # 完整經過順序（含中間 ROI），供除錯 / 進階分析
-    roi_count = len(ordered)
 
     # 車種投票：取票數最多的類別
     if state.get("class_votes"):
