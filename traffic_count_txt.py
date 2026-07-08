@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-DeepStream 設定檔自動產生器（車流版）
+DeepStream 設定檔自動產生器（TMC版）
 
 主要功能：
 1. 讀取 ds_yaml/*.yaml 各路 cam 設定，自動產生 5 份 DeepStream 組態檔
@@ -208,6 +208,37 @@ def crop_points_to_rect(points: List[List[int]]) -> Tuple[int, int, int, int]:
     return int(min_x), int(min_y), width, height
 
 
+def _ds_lib_root() -> str:
+    """
+    自動偵測 DeepStream 的 lib 根目錄（跨平台 / 跨版本）。
+    順序：環境變數 DS_LIB_ROOT → /opt/nvidia/deepstream/deepstream/lib →
+          /opt/nvidia/deepstream/deepstream*/lib（glob 取最後一個）→ 標準路徑保底。
+    """
+    env = os.environ.get("DS_LIB_ROOT", "").strip()
+    if env and os.path.isdir(env):
+        return env
+    std = "/opt/nvidia/deepstream/deepstream/lib"
+    if os.path.isdir(std):
+        return std
+    hits = sorted(glob.glob("/opt/nvidia/deepstream/deepstream*/lib"))
+    if hits:
+        return hits[-1]
+    return std
+
+
+def resolve_tracker_lib() -> str:
+    """自動解析 nvtracker 的 ll-lib-file 路徑（DS_TRACKER_LIB 可覆寫；找不到以標準 nvidia 路徑保底）。"""
+    env = os.environ.get("DS_TRACKER_LIB", "").strip()
+    if env and os.path.exists(env):
+        return env
+    return os.path.join(_ds_lib_root(), "libnvds_nvmultiobjecttracker.so")
+
+
+def resolve_preprocess_lib() -> str:
+    """自動解析 nvdspreprocess 的 custom-lib-path（找不到以標準 nvidia 路徑保底）。"""
+    return os.path.join(_ds_lib_root(), "gst-plugins", "libcustom2d_preprocess.so")
+
+
 def _use_new_mux() -> bool:
     """是否使用新版 nvstreammux（與 main.py 的 setdefault "yes" 一致；獨立執行時同樣預設 yes）。"""
     return os.environ.get("USE_NEW_NVSTREAMMUX", "yes") == "yes"
@@ -391,7 +422,7 @@ def generate_preprocess_config(cfgs: List[Dict[str, Any]]) -> None:
         "scaling-filter=0",
         "maintain-aspect-ratio=1",
         "symmetric-padding=1",
-        "custom-lib-path=/opt/nvidia/deepstream/deepstream/lib/gst-plugins/libcustom2d_preprocess.so",
+        f"custom-lib-path={resolve_preprocess_lib()}",
         "custom-tensor-preparation-function=CustomTensorPreparation",
         "",
         "[user-configs]",
@@ -750,7 +781,7 @@ def generate_deepstream_app_config(cfgs: List[Dict[str, Any]], muxer_w: int, mux
         "enable=1",
         "tracker-width=640",
         "tracker-height=384",
-        "ll-lib-file=/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so",
+        f"ll-lib-file={resolve_tracker_lib()}",
         f"ll-config-file={BASE_DIR}/config_tracker_NvDCF_accuracy.yml",
         "gpu-id=0",
         "display-tracking-id=1",
