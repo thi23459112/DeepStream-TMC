@@ -9,15 +9,16 @@ DeepStream 7.1 車流計數主程式
 2. 條件式掛載探針：
    - nvdcf  → tracker_src_pad_buffer_probe 掛在 tracker.src
    - BoxMOT → boxmot_pgie_src_probe 掛在 pgie.src
-3. 多路 cam 各自的下游分支：本地預覽 / 影片存檔 / RTSP 推流
-4. RTSP server：把每路 cam 的 udpsink 註冊成獨立 mount_path
-5. 安全結束機制：Q 鍵 / Ctrl+C 觸發 EOS，等影片封裝完成才退出
+3. 多路 cam 各自的下游分支：本地預覽 / 影片存檔
+4. RTSP 斷線防護（只作用於即時串流路，檔案來源不受影響）：
+   第一層 nvurisrcbin 內建重連（無限重試）；第二層看門狗卡死單路重啟。
+   兩層都持續到 EOS 為止：按 Q / SIGINT / SIGTERM 後看門狗立即停止。
+5. 安全結束機制：Q 鍵 / Ctrl+C / systemctl stop 觸發 EOS，等影片封裝完成才退出
 """
 
 import os
 import sys
 import time
-import select
 import signal
 import termios
 import threading
@@ -25,20 +26,23 @@ import tty
 # 啟用新版 nvstreammux：多路檔案來源時某一路先 EOS 不拖慢其餘來源。
 # 必須在 import gi 之前，GStreamer 載入 nvstreammux 外掛時才讀得到。
 os.environ.setdefault("USE_NEW_NVSTREAMMUX", "yes")
+# GLib/GIO 建立網路（RTSP）連線時會呼叫系統 libproxy 偵測 proxy。在 conda 環境下，
+# conda 的 libstdc++ 與系統 libunwind ABI 不相容，libproxy 拋例外時無法正常 unwind
+# 而導致行程 abort。改用 GIO 內建 dummy proxy resolver 完全繞過 libproxy。
+# 須在匯入 gi 之前設定；系統 Python 不受影響，setdefault 也不覆蓋外部既有設定。
+os.environ.setdefault("GIO_USE_PROXY_RESOLVER", "dummy")
 import gi
 gi.require_version('Gst', '1.0')
-gi.require_version('GstRtspServer', '1.0')
-from gi.repository import GLib, Gst, GstRtspServer
+from gi.repository import GLib, Gst
 
-from logic.color import load_labels, CLASS_MAP
 from logic.config import (
     SOURCE_CONFIGS, INFER_CONFIG, TRACKER_CONFIG,
     PREPROCESS_CONFIG, ANALYTICS_CONFIG,
-    TRACKER_MODE, BOXMOT_TRACKER_CONFIG,
+    TRACKER_MODE,
 )
-from logic.state_db import initialize_state_managers, force_finalize_all
+from logic.state_db import initialize_state_managers, force_finalize_all, fps_streams
 from logic.pipeline import (
-    cb_newpad, cb_source_setup, make_elm,
+    cb_newpad, cb_decodebin_child_added, make_elm, resolve_tracker_lib,
     _build_display_sink, setup_cam_branch,
 )
 from logic.probes import (
@@ -55,7 +59,16 @@ from logic.probes import (
 g_loop          = None     # GLib 主迴圈
 g_pipeline      = None     # GStreamer 主 pipeline
 g_eos_triggered = False    # EOS 是否已發送（避免重複觸發）
-g_rtsp_server   = None     # RTSP server 引用（持有避免被 GC）
+
+# ---- 看門狗（第二層防護：只針對「即時串流」路，檔案來源不適用）----
+# 第一層：nvurisrcbin 內建 rtsp-reconnect，涵蓋「有斷線錯誤」的情況。
+# 第二層：看門狗定期檢查各 RTSP 路最後吐幀時間，涵蓋「無錯誤但卡死不吐幀」的情況（單路重啟）。
+# 兩層都只到 EOS 為止：按 Q / SIGINT / SIGTERM 觸發 EOS 後，看門狗立即停止，不干擾收尾。
+g_sources      = {}    # pad_index -> {"src": nvurisrcbin, "streammux": mux, "cam": source_id}
+g_last_restart = {}    # pad_index -> 上次重啟時間戳（防連環重啟）
+WATCHDOG_STALL_SEC = 60    # 連續幾秒沒吐幀 → 判定卡死
+WATCHDOG_GRACE_SEC = 60    # 重啟後寬限幾秒（期間不再判定）
+WATCHDOG_CHECK_SEC = 10    # 每幾秒檢查一次
 
 # --- 關閉行為逾時設定（可依需求調整）---
 # EOS_WAIT_SECONDS：按 Q 後，給影片檔收尾的等待秒數，超過就強制結束主迴圈
@@ -193,6 +206,59 @@ def bus_call(bus, message, loop):
 # 3. Pipeline 輔助 (Pipeline Helpers)
 # ==========================================
 
+def _restart_one_source(pad_index):
+    """
+    單獨重啟某一路 nvurisrcbin（看門狗判定卡死時由 GLib.idle_add 在主線程呼叫）。
+
+    流程：source 設 NULL → 等狀態確實切換 → 重設 PLAYING。
+    重啟後 nvurisrcbin 重連來源、重新吐 pad → cb_newpad 找回既有（未連結的）
+    streammux sink pad 直接重接。不動其他路，互不影響。
+    """
+    info = g_sources.get(pad_index)
+    if not info:
+        return False
+    if g_eos_triggered:      # 已在收尾流程 → 不再重啟，避免干擾影片封裝
+        return False
+    src, cam = info["src"], info["cam"]
+    print(f"[WATCHDOG] 重啟 {cam}（pad={pad_index}）...")
+    try:
+        src.set_state(Gst.State.NULL)
+        src.get_state(Gst.CLOCK_TIME_NONE)   # 等狀態確實切到 NULL
+        src.set_state(Gst.State.PLAYING)
+        g_last_restart[pad_index] = time.time()
+        print(f"[WATCHDOG] {cam} 已送出重啟，等待重新連線...")
+    except Exception as e:
+        print(f"[WATCHDOG] 重啟 {cam} 發生例外: {e}")
+    return False   # 給 idle_add 用，只跑一次
+
+
+def _watchdog_check():
+    """
+    每 WATCHDOG_CHECK_SEC 秒檢查各「RTSP 路」最後吐幀時間，卡死超過門檻就單路重啟。
+
+    只監控 g_sources 內的路（建立來源時只收錄即時串流，檔案來源播完不吐幀是正常現象，
+    絕不能重啟——否則影片會從頭重播、DB 重複計數）。
+    EOS 觸發（按 Q / SIGINT / SIGTERM）後回傳 False 停止本 timer，不干擾收尾封裝。
+    """
+    if g_eos_triggered:
+        print("[WATCHDOG] 偵測到 EOS 收尾流程，看門狗停止")
+        return False
+    now = time.time()
+    for pad_index, info in list(g_sources.items()):
+        # 重啟寬限期內不判定
+        if now - g_last_restart.get(pad_index, 0) < WATCHDOG_GRACE_SEC:
+            continue
+        stats = fps_streams.get(pad_index, {})
+        ts = stats.get("timestamps")
+        if not ts:
+            continue   # 還沒收過任何幀（剛啟動/首連中），交給 nvurisrcbin 內建重連
+        idle = now - ts[-1]
+        if idle >= WATCHDOG_STALL_SEC:
+            print(f"[WATCHDOG] {info['cam']}（pad={pad_index}）已 {idle:.0f} 秒無新幀，判定卡死 → 單路重啟")
+            GLib.idle_add(_restart_one_source, pad_index)
+    return True   # 回 True 讓 timer 持續
+
+
 def _enlarge_queue(q, max_buffers=400):
     """
     放寬 queue 容量，避免下游處理偶發較慢時被反壓
@@ -205,70 +271,6 @@ def _enlarge_queue(q, max_buffers=400):
     q.set_property("max-size-bytes", 0)
     q.set_property("max-size-time", 0)
 
-
-def _start_rtsp_server(rtsp_routes):
-    """
-    啟動 GstRtspServer 並把每路 cam 的 udpsink 端口註冊成 mount_path
-
-    處理流程：
-    1. 依 port 分組（同 port 不同 mount_path 共用一台 server）
-    2. 為每個 port 建一個 RTSPServer
-    3. 為每路 cam 建一個 RTSPMediaFactory，套用對應的 udpsrc + rtp{h264,h265}pay
-
-    參數：
-        rtsp_routes (list[dict]): 每路 cam 的推流設定
-            {pad_index, udp_port, port, mount_path, encoder}
-
-    返回：
-        list | None: 啟動的 RTSPServer 列表（None 表示無推流需求）
-    """
-    if not rtsp_routes:
-        return None
-
-    # 步驟 1: 依 port 分組
-    routes_by_port = {}
-    for r in rtsp_routes:
-        routes_by_port.setdefault(r["port"], []).append(r)
-
-    # 步驟 2: 每個 port 啟一台 RTSP server
-    servers = []
-    for port, routes in routes_by_port.items():
-        server = GstRtspServer.RTSPServer()
-        server.set_service(str(port))
-        mounts = server.get_mount_points()
-
-        # 步驟 3: 每路 cam 註冊一個 mount_path
-        for r in routes:
-            udp_port   = r["udp_port"]
-            encoder    = r["encoder"]
-            mount_path = "/" + r["mount_path"].lstrip("/")
-
-            # encoding-name 必須對齊客戶端，否則 SDP 不匹配連不上
-            enc_name = "H265" if encoder == "h265" else "H264"
-
-            launch_str = (
-                f"( udpsrc port={udp_port} caps=\"application/x-rtp, "
-                f"media=video, clock-rate=90000, encoding-name={enc_name}, payload=96\" "
-                f"! rtp{encoder}depay ! rtp{encoder}pay name=pay0 pt=96 )"
-            )
-
-            factory = GstRtspServer.RTSPMediaFactory()
-            factory.set_launch(launch_str)
-            factory.set_shared(True)   # 多客戶端可同時連同一 mount
-            mounts.add_factory(mount_path, factory)
-
-            print(f"[INFO] RTSP 推流註冊: rtsp://<本機IP>:{port}{mount_path} "
-                  f"(encoder={encoder}, udp_port={udp_port})")
-
-        server.attach(None)
-        servers.append(server)
-
-    return servers
-
-
-# ==========================================
-# 4. 主程式 (Main)
-# ==========================================
 
 def main():
     """
@@ -285,14 +287,14 @@ def main():
     8. 啟動 RTSP server（若有 cam 啟用推流）
     9. 進入 GLib 主迴圈，等待 Q 鍵或 EOS 退出
     """
-    global g_loop, g_pipeline, g_eos_triggered, g_rtsp_server
+    global g_loop, g_pipeline, g_eos_triggered
 
     # ---- 步驟 1: 印追蹤器模式 + (BoxMOT) 初始化 tracker instance ----
     if TRACKER_MODE == "nvdcf":
         print("[INFO] 初始化 DeepStream 車流架構：PGIE → NvDCF (內建追蹤器) → Analytics")
     else:
         print(f"[INFO] 初始化 DeepStream 車流架構：PGIE → {TRACKER_MODE} (BoxMOT) → Analytics")
-        print(f"[INFO]   pipeline 將跳過 nvtracker，追蹤交由 pgie.src 上的 BoxMOT 探針處理")
+        print("[INFO]   pipeline 將跳過 nvtracker，追蹤交由 pgie.src 上的 BoxMOT 探針處理")
 
         from logic.boxmot_adapter import initialize_boxmot_trackers
         initialize_boxmot_trackers()
@@ -328,21 +330,36 @@ def main():
         streammux.set_property("nvbuf-memory-type", 0)
     g_pipeline.add(streammux)
 
-    # ---- 步驟 3: 每路 cam 建一個 nvurisrcbin（內建 RTSP 自動重連）----
+    # ---- 步驟 3: 每路 cam 建一個 nvurisrcbin（RTSP 路啟用內建斷線自動重連）----
     # nvurisrcbin 是 DeepStream 自家的來源元件，輸出已是 NVMM 影格、可直接接 streammux，
     # 且支援 RTSP 斷線後自動重連 —— 單一攝影機掉線時整支程式不會死，會自己重連。
     for pad_index, cfg in SOURCE_CONFIGS.items():
         source = make_elm("nvurisrcbin", f"uri-decode-bin-{pad_index}")
         source.set_property("uri", cfg["source"])
 
-        # RTSP 自動重連與傳輸設定（用 helper 設定，舊版 DeepStream 缺屬性也不會報錯）
-        _set_prop_if_exists(source, "rtsp-reconnect-interval", RTSP_RECONNECT_INTERVAL)
-        _set_prop_if_exists(source, "rtsp-reconnect-attempts", RTSP_RECONNECT_ATTEMPTS)
-        _set_prop_if_exists(source, "select-rtp-protocol", RTSP_RTP_PROTOCOL)
-        _set_prop_if_exists(source, "latency", 200)
+        is_live = not cfg.get("is_file_source", False)
+        if is_live:
+            # 第一層防護：RTSP 自動重連與傳輸設定（缺屬性的舊版 DeepStream 自動略過）
+            _set_prop_if_exists(source, "rtsp-reconnect-interval", RTSP_RECONNECT_INTERVAL)
+            _set_prop_if_exists(source, "rtsp-reconnect-attempts", RTSP_RECONNECT_ATTEMPTS)
+            _set_prop_if_exists(source, "select-rtp-protocol", RTSP_RTP_PROTOCOL)
+            _set_prop_if_exists(source, "latency", 200)
+            _set_prop_if_exists(source, "udp-buffer-size", 2000000)
+            print(f"[INFO] {cfg.get('source_id', pad_index)} 為即時串流："
+                  f"啟用自動重連（{RTSP_RECONNECT_INTERVAL}s 間隔、無限重試）")
 
         source.connect("pad-added", cb_newpad, {"streammux": streammux, "pad_index": pad_index})
+        # 內部 rtspsrc 的 TCP / 逾時調校（nvurisrcbin 用 child-added 遞迴抓，取代 source-setup）
+        source.connect("child-added", cb_decodebin_child_added, None)
         g_pipeline.add(source)
+
+        # 第二層防護：看門狗只登記「即時串流」路（檔案來源播完不吐幀是正常現象，
+        # 絕不能重啟——否則影片會從頭重播、DB 重複計數）
+        if is_live:
+            g_sources[pad_index] = {
+                "src": source, "streammux": streammux,
+                "cam": cfg.get("source_id", f"cam{pad_index}"),
+            }
 
     # ---- 步驟 4: 共用推論元件 ----
     q1          = make_elm("queue", "q1")
@@ -367,10 +384,7 @@ def main():
     if TRACKER_MODE == "nvdcf":
         tracker = make_elm("nvtracker", "tracker")
         tracker.set_property("ll-config-file", TRACKER_CONFIG)
-        tracker.set_property(
-            "ll-lib-file",
-            "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so",
-        )
+        tracker.set_property("ll-lib-file", resolve_tracker_lib())
         tracker.set_property("tracker-width", 640)
         tracker.set_property("tracker-height", 384)
 
@@ -420,27 +434,10 @@ def main():
 
     display_streammux = _build_display_sink(g_pipeline, num_sources) if show_window else None
 
-    # 收集所有啟用 RTSP 推流的路，等下批次註冊到 RTSP server
-    rtsp_routes = []
     for pad_index, cfg in SOURCE_CONFIGS.items():
-        udp_port = setup_cam_branch(
+        setup_cam_branch(
             g_pipeline, pad_index, cfg, demux, display_streammux, per_cam_osd_probe
         )
-        if udp_port is not None:
-            rtsp_routes.append({
-                "pad_index":  pad_index,
-                "udp_port":   udp_port,
-                "port":       cfg["rtsp_push"]["port"],
-                "mount_path": cfg["rtsp_push"]["mount_path"],
-                "encoder":    cfg["rtsp_push"]["encoder"],
-            })
-
-    # ---- 步驟 8: 啟動 RTSP server ----
-    if rtsp_routes:
-        g_rtsp_server = _start_rtsp_server(rtsp_routes)
-        print(f"[INFO] 共 {len(rtsp_routes)} 條 RTSP 推流就緒")
-    else:
-        print("[INFO] 無 cam 啟用 RTSP 推流，跳過 RTSP server 啟動")
 
     # ---- 步驟 9: 訊號處理 +（有終端機時才）鍵盤監聽 + 主迴圈 ----
     g_loop = GLib.MainLoop()
@@ -480,6 +477,13 @@ def main():
         bus.connect("message", bus_call, g_loop)
 
         g_pipeline.set_state(Gst.State.PLAYING)
+
+        # 看門狗：只有存在 RTSP 路時才啟動（檔案批次跑不啟動、也不該監控）
+        if g_sources:
+            GLib.timeout_add_seconds(WATCHDOG_CHECK_SEC, _watchdog_check)
+            print(f"[INFO] 看門狗啟動：監控 {len(g_sources)} 路即時串流，"
+                  f"每 {WATCHDOG_CHECK_SEC}s 檢查，卡死門檻 {WATCHDOG_STALL_SEC}s，重啟寬限 {WATCHDOG_GRACE_SEC}s")
+
         g_loop.run()
 
     finally:
