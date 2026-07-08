@@ -25,7 +25,7 @@ import threading
 import tty
 # 啟用新版 nvstreammux：多路檔案來源時某一路先 EOS 不拖慢其餘來源。
 # 必須在 import gi 之前，GStreamer 載入 nvstreammux 外掛時才讀得到。
-os.environ.setdefault("USE_NEW_NVSTREAMMUX", "yes")
+os.environ.setdefault("USE_NEW_NVSTREAMMUX", "no")
 # GLib/GIO 建立網路（RTSP）連線時會呼叫系統 libproxy 偵測 proxy。在 conda 環境下，
 # conda 的 libstdc++ 與系統 libunwind ABI 不相容，libproxy 拋例外時無法正常 unwind
 # 而導致行程 abort。改用 GIO 內建 dummy proxy resolver 完全繞過 libproxy。
@@ -82,7 +82,7 @@ TEARDOWN_WAIT_SECONDS = 5
 # RTSP_RECONNECT_ATTEMPTS：最多重連次數（-1=無限重連；此屬性需 DeepStream 6.3 以上才有，
 #                          舊版會自動略過、改用「每隔 interval 秒持續重試」的行為）
 # RTSP_RTP_PROTOCOL      ：傳輸協定，4=TCP（較穩、對應原本 rtspsrc protocols=4）、0=UDP
-RTSP_RECONNECT_INTERVAL = 10
+RTSP_RECONNECT_INTERVAL = 5
 RTSP_RECONNECT_ATTEMPTS = -1
 RTSP_RTP_PROTOCOL       = 4
 
@@ -220,13 +220,29 @@ def _restart_one_source(pad_index):
     if g_eos_triggered:      # 已在收尾流程 → 不再重啟，避免干擾影片封裝
         return False
     src, cam = info["src"], info["cam"]
+    streammux = info["streammux"]
     print(f"[WATCHDOG] 重啟 {cam}（pad={pad_index}）...")
     try:
+        # 1) 先斷開並 release streammux 的 sink pad —— 關鍵！
+        #    若不先解開，nvurisrcbin 設 NULL 時 src pad 仍連在 streammux 上，
+        #    bin 無法乾淨拆除，會殘留舊的 vsrc_0 幽靈 pad，重新 PLAYING 時報
+        #    「Padname vsrc_0 is not unique」→ 新 pad 加不進去 → 永遠接不回來。
+        sinkpad = streammux.get_static_pad(f"sink_{pad_index}")
+        if sinkpad is not None:
+            peer = sinkpad.get_peer()
+            if peer is not None:
+                peer.unlink(sinkpad)
+            streammux.release_request_pad(sinkpad)
+
+        # 2) 該路 source 設 NULL，等狀態確實切換
         src.set_state(Gst.State.NULL)
-        src.get_state(Gst.CLOCK_TIME_NONE)   # 等狀態確實切到 NULL
+        src.get_state(Gst.CLOCK_TIME_NONE)
+
+        # 3) 重新 PLAYING：nvurisrcbin 重連 RTSP、重新吐 pad → cb_newpad
+        #    因 pad 已 release，會 get_request_pad 重新要一個乾淨的 sink_N 接回
         src.set_state(Gst.State.PLAYING)
         g_last_restart[pad_index] = time.time()
-        print(f"[WATCHDOG] {cam} 已送出重啟，等待重新連線...")
+        print(f"[WATCHDOG] {cam} 已送出重啟（已釋放 streammux pad），等待重新連線...")
     except Exception as e:
         print(f"[WATCHDOG] 重啟 {cam} 發生例外: {e}")
     return False   # 給 idle_add 用，只跑一次
