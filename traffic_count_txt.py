@@ -208,18 +208,73 @@ def crop_points_to_rect(points: List[List[int]]) -> Tuple[int, int, int, int]:
     return int(min_x), int(min_y), width, height
 
 
+def _use_new_mux() -> bool:
+    """是否使用新版 nvstreammux（與 main.py 的 setdefault "yes" 一致；獨立執行時同樣預設 yes）。"""
+    return os.environ.get("USE_NEW_NVSTREAMMUX", "yes") == "yes"
+
+
+# --- 舊版 mux 的固定輸出座標系（解析度自動換算用；與 logic/config.py 一致）---
+MUX_OUTPUT_W = 1920
+MUX_OUTPUT_H = 1080
+
+
+def _scale_points(points, base_w, base_h):
+    """把來源真實解析度座標的點位換算成 1920×1080 座標（比例 1:1 時原樣回傳）。"""
+    if not points or not base_w or not base_h:
+        return points
+    sx = MUX_OUTPUT_W / float(base_w)
+    sy = MUX_OUTPUT_H / float(base_h)
+    if sx == 1.0 and sy == 1.0:
+        return points
+    return [[int(round(p[0] * sx)), int(round(p[1] * sy))] for p in points]
+
+
+def scale_geometry_to_output(cfgs: List[Dict[str, Any]]) -> None:
+    """
+    就地把每路 cam 的 geometry（regions / crop_points）對齊 streammux 輸出座標系。
+
+    舊版 mux（USE_NEW_NVSTREAMMUX != "yes"）：畫面統一縮到 1920×1080 →
+        依 base_w/base_h 比例把 ROI/crop 換算成 1080P 座標（混合解析度來源也對得齊），
+        與執行期 logic/config.py 的行為完全一致。
+    新版 mux（"yes"，本專案預設）：畫面保持原生解析度 → 原生點位天然對齊，本函式不動作。
+    """
+    if _use_new_mux():
+        return
+    for cfg in cfgs:
+        geo = cfg.get("geometry", {}) or {}
+        base_w = int(geo.get("base_w", MUX_OUTPUT_W))
+        base_h = int(geo.get("base_h", MUX_OUTPUT_H))
+        regions_src = geo.get("regions", {}) or {}
+        geo["regions"] = {
+            name: (_scale_points(pts, base_w, base_h) if pts else pts)
+            for name, pts in regions_src.items()
+        }
+        crop_src = geo.get("crop_points")
+        if crop_src:
+            geo["crop_points"] = _scale_points(crop_src, base_w, base_h)
+        if (base_w, base_h) != (MUX_OUTPUT_W, MUX_OUTPUT_H):
+            print(f"[INFO] {cfg.get('source_id','cam')} 來源座標 {base_w}x{base_h} → "
+                  f"換算成 {MUX_OUTPUT_W}x{MUX_OUTPUT_H}（舊版 mux，ROI/crop 依比例縮放）")
+        geo["base_w"] = MUX_OUTPUT_W
+        geo["base_h"] = MUX_OUTPUT_H
+        cfg["geometry"] = geo
+
+
 def resolve_muxer_size(cfgs: List[Dict[str, Any]]) -> Tuple[int, int]:
     """
-    所有 cam 的 base_w / base_h 取最大值供 streammux 使用
+    決定 analytics / 顯示設定用的座標系尺寸。
 
-    streammux 會把所有 stream 都縮放到這個尺寸
+    舊版 mux：固定 (1920, 1080)——畫面統一縮到此尺寸，且 ROI/crop 已由
+        scale_geometry_to_output() 換算到同一座標系（混合解析度也對得齊）。
+    新版 mux（預設）：畫面不縮放，維持原行為取各路 base_w/base_h 最大值。
 
     參數：
         cfgs (list[dict]): 各路 cam 設定
-
     返回：
         tuple: (muxer_width, muxer_height)
     """
+    if not _use_new_mux():
+        return MUX_OUTPUT_W, MUX_OUTPUT_H
     max_w = max(cfg["geometry"]["base_w"] for cfg in cfgs)
     max_h = max(cfg["geometry"]["base_h"] for cfg in cfgs)
     return max_w, max_h
@@ -733,9 +788,13 @@ def main() -> None:
     cfgs = load_all_yamls(YAML_DIR)
     print(f"已載入 {len(cfgs)} 個攝影機設定")
 
+    # 步驟 0: ROI/crop 座標對齊 streammux 輸出座標系（舊版 mux 才會實際縮放，與執行期一致）
+    scale_geometry_to_output(cfgs)
+
     # 步驟 1: 算 streammux 尺寸與 engine 參數
     muxer_w, muxer_h = resolve_muxer_size(cfgs)
-    print(f"Streammux 輸出尺寸: {muxer_w} x {muxer_h}")
+    print(f"Streammux 輸出尺寸: {muxer_w} x {muxer_h}"
+          + ("（新版 mux：畫面不縮放，座標為各路原生解析度）" if _use_new_mux() else "（舊版 mux：統一縮放）"))
 
     car_batch = get_car_engine_batch(cfgs)
     car_imgsz = get_car_engine_imgsz(cfgs)
@@ -752,7 +811,7 @@ def main() -> None:
         if regions:
             print(f"           ROI 數量: {len(regions)} → {list(regions.keys())}")
         else:
-            print(f"           未定義 ROI，將使用全畫面")
+            print("           未定義 ROI，將使用全畫面")
 
     # 步驟 3: 依序產生 5 個設定檔
     generate_preprocess_config(cfgs)
@@ -773,7 +832,7 @@ def main() -> None:
     # BoxMOT 模式額外提示
     if tracker_mode != "nvdcf":
         print(f"\n  ⚠ tracker.type = '{tracker_mode}' (BoxMOT)")
-        print(f"     main.py 啟動後將 *跳過* nvtracker，改在 pgie.src 探針裡用 BoxMOT 接管")
+        print("     main.py 啟動後將 *跳過* nvtracker，改在 pgie.src 探針裡用 BoxMOT 接管")
         print(f"     BoxMOT 微調請直接編輯：boxmot/configs/trackers/{tracker_mode}.yaml")
 
 
