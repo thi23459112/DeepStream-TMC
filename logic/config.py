@@ -28,6 +28,34 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # YAML_DIR = f"{BASE_DIR}/ds_yaml"
 YAML_DIR = os.environ.get("DS_YAML_DIR", f"{BASE_DIR}/ds_yaml")
 
+# --- streammux 輸出座標系（解析度自動換算用）---
+# 舊版 nvstreammux（USE_NEW_NVSTREAMMUX != "yes"）會把所有來源縮放到固定 1920×1080，
+# 此時物件座標在 1080P 空間 → YAML 按「來源真實解析度」標的 ROI/crop 須依 base_w/base_h
+# 比例換算成 1080P 座標，混合解析度來源（720P/4K）才不會歪。
+# 新版 nvstreammux（"yes"，本專案預設）不縮放畫面、各路保持原始解析度 →
+# 物件座標本來就是來源原生座標，YAML 原生點位「天然對齊」，不需（也不可）縮放。
+MUX_OUTPUT_W = 1920
+MUX_OUTPUT_H = 1080
+
+
+def _use_new_mux():
+    """是否使用新版 nvstreammux（main.py 已 setdefault "yes"；獨立執行時同樣預設 yes）。"""
+    return os.environ.get("USE_NEW_NVSTREAMMUX", "yes") == "yes"
+
+
+def _scale_points(points, base_w, base_h):
+    """
+    把「來源真實解析度(base_w×base_h)」座標系的點位換算成 streammux 輸出(1920×1080)座標系。
+    僅在舊版 mux 下由呼叫端使用；比例 1:1 時原樣回傳。
+    """
+    if not points or not base_w or not base_h:
+        return points
+    sx = MUX_OUTPUT_W / float(base_w)
+    sy = MUX_OUTPUT_H / float(base_h)
+    if sx == 1.0 and sy == 1.0:
+        return points
+    return [[int(round(p[0] * sx)), int(round(p[1] * sy))] for p in points]
+
 # --- DeepStream 主要設定檔路徑 ---
 INFER_CONFIG       = f"{BASE_DIR}/config_infer_primary_yolo11.txt"
 TRACKER_CONFIG     = f"{BASE_DIR}/config_tracker_NvDCF_accuracy.yml"
@@ -94,7 +122,7 @@ def _resolve_source_uri(raw):
     if not os.path.exists(s):
         print(f"[WARNING] source 對應的檔案不存在：{s}")
         print(f"[WARNING]   原始 YAML 寫法：'{raw}'")
-        print(f"[WARNING]   pipeline 啟動時很可能失敗，請確認路徑與檔名")
+        print("[WARNING]   pipeline 啟動時很可能失敗，請確認路徑與檔名")
 
     return f"file://{s}"
 
@@ -138,8 +166,7 @@ def load_dynamic_configs(yaml_dir):
        - video_path            : 輸出影片絕對路徑
        - source / stream_fps   : 解析後的 URI 與真實 FPS
        - is_file_source        : 來源是否為本地檔案
-       - start_time_dt         : 影片首幀對應的真實時刻
-       - rtsp_push             : RTSP 推流標準化設定 dict
+       - start_time_dt         : 影片首幀對應的真實時刻（RTSP 為 None）
        - road_names            : ROI → 路段名稱對照 {roi_name: 路名}
 
     參數：
@@ -164,8 +191,30 @@ def load_dynamic_configs(yaml_dir):
         device_cfg = data.get("device", {}) or {}
         data["device_code"] = str(device_cfg.get("code", "UNKNOWN"))
 
-        # 步驟 2: 多 ROI 轉 numpy（給 probe 的 pointPolygonTest 用）
-        regions_raw = data.get("geometry", {}).get("regions", {}) or {}
+        # 步驟 2: ROI / crop 座標對齊 + 多 ROI 轉 numpy（給 probe 的 pointPolygonTest 用）
+        # 舊版 mux：所有畫面縮到 1920×1080 → ROI/crop 依 base_w/base_h 換算成 1080P 座標。
+        # 新版 mux（預設）：畫面保持原生解析度 → 原生點位天然對齊，不縮放。
+        geo = data.get("geometry", {}) or {}
+        base_w = int(geo.get("base_w", MUX_OUTPUT_W))
+        base_h = int(geo.get("base_h", MUX_OUTPUT_H))
+
+        if not _use_new_mux():
+            regions_src = geo.get("regions", {}) or {}
+            geo["regions"] = {
+                name: (_scale_points(pts, base_w, base_h) if pts else pts)
+                for name, pts in regions_src.items()
+            }
+            crop_src = geo.get("crop_points")
+            if crop_src:
+                geo["crop_points"] = _scale_points(crop_src, base_w, base_h)
+            if (base_w, base_h) != (MUX_OUTPUT_W, MUX_OUTPUT_H):
+                print(f"[INFO] {cam_name} 來源座標 {base_w}x{base_h} → 自動換算成 "
+                      f"{MUX_OUTPUT_W}x{MUX_OUTPUT_H}（舊版 mux，ROI/crop 依比例縮放）")
+            geo["base_w"] = MUX_OUTPUT_W
+            geo["base_h"] = MUX_OUTPUT_H
+            data["geometry"] = geo
+
+        regions_raw = geo.get("regions", {}) or {}
         cv_regions = {}
         for roi_name, pts in regions_raw.items():
             if pts and len(pts) >= 3:
@@ -268,16 +317,6 @@ def load_dynamic_configs(yaml_dir):
         data["start_time_dt"] = _parse_start_time(
             data.get("start_time") if data["is_file_source"] else None
         )
-
-        # 步驟 8: RTSP 推流設定標準化
-        rtsp_cfg = data.get("rtsp_push", {}) or {}
-        data["rtsp_push"] = {
-            "enable":     bool(rtsp_cfg.get("enable", False)),
-            "port":       int(rtsp_cfg.get("port", 8554)),
-            "mount_path": str(rtsp_cfg.get("mount_path", cam_name)),
-            "bitrate":    int(rtsp_cfg.get("bitrate", 4000000)),
-            "encoder":    str(rtsp_cfg.get("encoder", "h264")).lower(),
-        }
 
         configs[pad_index] = data
 
