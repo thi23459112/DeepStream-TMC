@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Created on Wed Dec 28 10:11:15 2022
-Updated: 逐筆上傳（伺服器只吃單筆物件）+ Session 連線重用 + 執行緒池並發 + 手動重試 + Bearer Token 驗證
+Updated: 整批打包上傳（改為單一 JSON 陣列一次送出）+ Session 連線重用 + 手動重試 + Bearer Token 驗證
 
 @author: kuan
 """
@@ -17,7 +17,6 @@ import urllib3
 import logging
 import threading
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -25,7 +24,7 @@ from requests.adapters import HTTPAdapter
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ⭐ 要掃描的資料夾：DeepStream 會在這裡為每一路攝影機各產生一個 .db（camA.db、camB.db...）
-DB_DIR = "/home/nvidia/DeepStream-TMC/output_db"
+DB_DIR = "/home/nvidia/THI/DeepStream-TMC/output_db"
 
 # 中央伺服器 API 接口
 API_URL  = "https://pingits.thix180server.com/pingits/api/AIData/AiTrafficFlowRawData"
@@ -39,14 +38,10 @@ PASSWORD      = "Msaj#aV6Lh"   # 請替換為實際密碼
 # Token 有效時間（秒）。伺服器 Token 存活 3 分鐘，提前 1 分鐘換，設 120 秒觸發刷新。
 TOKEN_TTL = 120
 
-# ⭐ 同時上傳的執行緒數（網路是瓶頸，調高可加速；若伺服器吃不消就調低）。
-#    設成 1 就等於關閉並發、變回逐筆序列上傳。
-MAX_WORKERS = 8
+# 單次批次請求逾時秒數（整批資料量較大，逾時設長一點）
+REQUEST_TIMEOUT = 30
 
-# 單筆請求逾時秒數
-REQUEST_TIMEOUT = 10
-
-# 單筆失敗後的最多重試次數（只對連線錯誤 / 5xx 重試；4xx 不重試）
+# 整批失敗後的最多重試次數（只對連線錯誤 / 5xx 重試；4xx 不重試）
 MAX_RETRIES = 2
 
 # ⭐ Log 檔名。為避免和「背景舊程式」搶同一個檔（造成權限不足或互相覆蓋），
@@ -105,12 +100,11 @@ logging.basicConfig(
 )
 
 
-# ── Token 管理（執行緒安全）────────────────────────────────────────
+# ── Token 管理（執行緒安全，維持原設計；即使目前單執行緒也不影響）─────
 class TokenManager:
     """
     集中管理 Bearer Token 的取得與刷新。
-    使用 threading.Lock() 確保多執行緒並發上傳時，
-    同一時間只有一條執行緒去打登入 API，不會重複刷新。
+    使用 threading.Lock() 確保同一時間只有一個地方去打登入 API，不會重複刷新。
     """
     def __init__(self):
         self._token      = None
@@ -176,17 +170,16 @@ class TokenManager:
             return None
 
 
-# 全域 TokenManager 實例（所有執行緒共用同一個）
+# 全域 TokenManager 實例
 token_manager = TokenManager()
 
 
 def build_session():
     """
-    建立一條共用的 HTTP Session：重用 TCP 連線與 TLS 交握（加速關鍵）。
-    連線池大小對齊執行緒數，避免並發時出現 connection pool is full 警告。
+    建立一條共用的 HTTP Session：重用 TCP 連線與 TLS 交握。
     """
     session = requests.Session()
-    adapter = HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS)
+    adapter = HTTPAdapter(pool_connections=1, pool_maxsize=1)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     session.verify = False  # 沿用原本行為（自簽憑證）。若伺服器有正式憑證，建議改成 True。
@@ -259,65 +252,72 @@ def fetch_rows(db_file, since_str):
     return records
 
 
-def upload_one(session, data):
+def upload_batch(session, records):
     """
-    上傳單一筆資料（伺服器接受的格式），含手動重試。
+    將整批資料打包成單一 JSON 陣列，一次 POST 送出，含手動重試。
     - 4xx（例如 400）：重送也不會成功，直接記錄詳細原因並回 False。
     - 連線錯誤 / 逾時 / 5xx：重試 MAX_RETRIES 次。
-    回傳: True 成功 / False 失敗。
+    回傳: True 整批成功 / False 整批失敗。
+
+    ⭐ 若中央 API 要求外層要包一個 key（例如 {"Data": [...]}），
+      請把下方 json_data = json.dumps(records) 改成
+      json_data = json.dumps({"Data": records})。
     """
-    json_data = json.dumps(data)
+    total = len(records)
+    json_data = json.dumps(records, ensure_ascii=False)
 
     for attempt in range(MAX_RETRIES + 1):
         # 每次嘗試前向 TokenManager 取得 Token（過期時會自動刷新）
         token = token_manager.get_token()
         if not token:
-            logging.error(
-                f"無法取得 Token，跳過此筆資料 "
-                f"(DeviceCode: {data.get('DeviceCode')}, CollectTime: {data.get('CollectTime')})"
-            )
+            logging.error(f"無法取得 Token，中止本批 {total} 筆資料的上傳。")
             return False
 
         headers = {
             "Content-Type":  "application/json",
             "Authorization": f"Bearer {token}"
         }
-
         try:
-            logging.info(f"準備上傳資料: {json.dumps(data, ensure_ascii=False)}")
-
+            logging.info(f"準備上傳整批資料，共 {total} 筆 → {API_URL}")
             response = session.post(API_URL, data=json_data, headers=headers, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
+            logging.info(f"整批上傳成功，共 {total} 筆。")
             return True
 
         except requests.exceptions.HTTPError as http_err:
             resp = http_err.response
             status = resp.status_code if resp is not None else None
+            resp_body = resp.text if resp is not None else "(無回應內容)"
+
+            # 4xx：客戶端資料問題，重送也不會成功，直接失敗
             if status is not None and 400 <= status < 500:
-                logging.error(
-                    f"上傳失敗 (DeviceCode: {data.get('DeviceCode')}, "
-                    f"CollectTime: {data.get('CollectTime')}): HTTP {status}"
-                )
-                logging.error(f"  ↳ 伺服器回應內容: {resp.text}")
-                logging.error(f"  ↳ 我們送出的 JSON: {json_data}")
+                logging.error(f"整批上傳失敗 (共 {total} 筆): HTTP {status}")
+                logging.error(f"  ↳ 伺服器回應內容: {resp_body}")
+                logging.error(f"  ↳ 我們送出的 JSON (前 500 字): {json_data[:500]}")
                 return False
+
+            # 5xx 或其他 HTTPError：還有重試次數就重試
             if attempt < MAX_RETRIES:
+                logging.warning(
+                    f"整批上傳暫時失敗 (HTTP {status})，準備重試第 {attempt + 1}/{MAX_RETRIES} 次"
+                )
+                logging.warning(f"  ↳ 伺服器回應內容: {resp_body}")
                 time.sleep(0.5 * (attempt + 1))
                 continue
-            logging.error(
-                f"上傳失敗(已重試 {MAX_RETRIES} 次) (DeviceCode: {data.get('DeviceCode')}, "
-                f"CollectTime: {data.get('CollectTime')}): {http_err}"
-            )
+
+            logging.error(f"整批上傳失敗(已重試 {MAX_RETRIES} 次) (共 {total} 筆): HTTP {status}")
+            logging.error(f"  ↳ 伺服器回應內容: {resp_body}")
+            logging.error(f"  ↳ 我們送出的 JSON (前 500 字): {json_data[:500]}")
             return False
 
         except requests.exceptions.RequestException as req_err:
             if attempt < MAX_RETRIES:
+                logging.warning(
+                    f"連線異常，準備重試第 {attempt + 1}/{MAX_RETRIES} 次: {req_err}"
+                )
                 time.sleep(0.5 * (attempt + 1))
                 continue
-            logging.error(
-                f"上傳失敗(已重試 {MAX_RETRIES} 次) (DeviceCode: {data.get('DeviceCode')}, "
-                f"CollectTime: {data.get('CollectTime')}): {req_err}"
-            )
+            logging.error(f"整批上傳失敗(已重試 {MAX_RETRIES} 次) (共 {total} 筆): {req_err}")
             return False
 
     return False
@@ -347,24 +347,19 @@ def main():
         logging.info("本次沒有需要上傳的資料。")
         return
 
-    # ===== 第二階段：用共用 Session + 執行緒池並發逐筆上傳 =====
-    logging.info(f"準備上傳 {total} 筆資料（並發 {MAX_WORKERS} 條連線）...")
+    # ===== 第二階段：所有攝影機的資料打包成單一 JSON 陣列，一次送出 =====
+    logging.info(f"準備將 {total} 筆資料打包成單一 JSON 一次上傳...")
 
     session = build_session()
-    success_count = 0
-    fail_count    = 0
     try:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [executor.submit(upload_one, session, rec) for rec in all_records]
-            for fut in as_completed(futures):
-                if fut.result():
-                    success_count += 1
-                else:
-                    fail_count += 1
+        ok = upload_batch(session, all_records)
     finally:
         session.close()
 
-    logging.info(f"上傳完成：成功 {success_count} 筆，失敗 {fail_count} 筆，總共 {total} 筆。")
+    if ok:
+        logging.info(f"上傳完成：成功 {total} 筆。")
+    else:
+        logging.info(f"上傳完成：失敗 {total} 筆。")
 
 
 if __name__ == '__main__':
