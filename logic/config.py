@@ -83,11 +83,11 @@ def _resolve_source_uri(raw):
     把 YAML 的 source 欄位轉成 GStreamer 可用的合法 URI
 
     支援寫法：
-        "videos/test3.mp4"               相對路徑 → 自動補 BASE_DIR 與 file:// 前綴
-        "/abs/path/to/file.mp4"          絕對路徑 → 自動補 file:// 前綴
-        "~/Videos/x.mp4"                 家目錄展開
-        "${BASE_DIR}/videos/x.mp4"       樣板展開
-        "file:///already/uri/x.mp4"      原樣使用
+        "videos/test3"               相對路徑 → 自動補 BASE_DIR 與 file:// 前綴
+        "/abs/path/to/file"          絕對路徑 → 自動補 file:// 前綴
+        "~/Videos/x"                 家目錄展開
+        "${BASE_DIR}/videos/x"       樣板展開
+        "file:///already/uri/x"      原樣使用
         "rtsp://user:pass@ip:port/path"  原樣使用
         "http://..." / "https://..."     原樣使用
 
@@ -272,7 +272,7 @@ def load_dynamic_configs(yaml_dir):
             video_dir = os.path.join(BASE_DIR, video_dir)
         if output_cfg.get("save_output_video", False):
             os.makedirs(video_dir, exist_ok=True)
-        data["video_path"] = os.path.join(video_dir, f"{cam_name}_output.mp4")
+        data["video_path"] = os.path.join(video_dir, f"{cam_name}_output.mkv")
 
         # 步驟 6: 來源 URI 解析
         source_uri = _resolve_source_uri(data.get("source", ""))
