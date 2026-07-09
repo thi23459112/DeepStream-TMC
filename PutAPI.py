@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 核心特色：
-1. [手動輪替] 程式啟動時自動檢查 Log 大小並搬移備份，維持 10MB 容量限制。
-2. [一次打包] 恢復單一 JSON 陣列一次送出，簡化上傳邏輯。
-3. [狀態追蹤] 首次部署清理後【立即存檔】，確保後續正常運作。
-4. [安全清理] 分批刪除舊資料，不卡死 AI 寫入。
-5. [數據統計] 任務結束時自動統計成功/失敗/總筆數。
+1. [手動輪替] 程式啟動時自動檢查 Log 大小並搬移備份，維持 10MB 容量限制
+2. [一次打包] 恢復單一 JSON 陣列一次送出，簡化上傳邏輯
+3. [狀態追蹤] 首次部署清理後【立即存檔】，確保後續正常運作
+4. [安全清理] 分批刪除舊資料，不卡死 AI 寫入
+5. [數據統計] 任務結束時自動統計成功/失敗/總筆數
 
 注意事項：
 - 本程式僅支援 Linux 環境（使用 fcntl 檔案鎖）
@@ -197,12 +197,12 @@ class TokenManager:
             token_data = response.json()
             
             if not token_data.get("isPasswordValid", False):
-                logger.error("登入失敗：帳號或密碼錯誤。")
+                logger.error("登入失敗：帳號或密碼錯誤")
                 return None
                 
             token = token_data.get("AccessToken")
             if not token:
-                logger.error("登入成功但找不到 AccessToken。")
+                logger.error("登入成功但找不到 AccessToken")
                 return None
             return token
             
@@ -410,7 +410,7 @@ def purge_history_data(db_files):
                 time.sleep(0.05)
                 
             if total_deleted > 0:
-                logger.info(f"[{name}] 首次部署清理：丟棄 {total_deleted} 筆歷史資料。")
+                logger.info(f"[{name}] 首次部署清理：丟棄 {total_deleted} 筆歷史資料")
                 
         except Exception as e:
             logger.error(f"[{name}] 首次清理失敗: {e}")
@@ -467,7 +467,7 @@ def upload_batch(session, records):
             logger.info(f"準備【一次打包】上傳，共 {total} 筆")
             response = session.post(API_URL, data=json_data, headers=headers, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
-            logger.info(f"整批上傳成功，共 {total} 筆。")
+            logger.info(f"整批上傳成功，共 {total} 筆")
             return True
             
         except requests.exceptions.HTTPError as http_err:
@@ -481,11 +481,11 @@ def upload_batch(session, records):
                 
             if attempt < MAX_RETRIES:
                 wait_time = 1.0 * (attempt + 1)
-                logger.warning(f"上傳暫時失敗 (HTTP {status})，{wait_time} 秒後重試。伺服器回應: {resp_text}")
+                logger.warning(f"上傳暫時失敗 (HTTP {status})，{wait_time} 秒後重試伺服器回應: {resp_text}")
                 time.sleep(wait_time)
                 continue
                 
-            logger.error(f"整批上傳最終失敗 (HTTP {status})。伺服器回應: {resp_text}")
+            logger.error(f"整批上傳最終失敗 (HTTP {status})伺服器回應: {resp_text}")
             return False
             
         except requests.exceptions.RequestException as req_err:
@@ -520,7 +520,7 @@ def main():
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except IOError:
-        logger.warning("偵測到另一個執行個體正在運行，本次結束。")
+        logger.warning("偵測到另一個執行個體正在運行，本次結束")
         lock_file.close()
         return
 
@@ -542,7 +542,7 @@ def main():
             for db_file in db_files:
                 state[os.path.basename(db_file)] = compute_default_since_str()
             save_state(state)
-            logger.info("首次部署清理完成，已初始化狀態檔。")
+            logger.info("首次部署清理完成，已初始化狀態檔")
 
         # === 步驟 5：建立 HTTP 會話 ===
         session = build_session()
@@ -567,10 +567,10 @@ def main():
                 # 上傳成功：更新狀態並清理舊資料
                 state[name] = max_time
                 cleanup_db(db_file, max_time, RETENTION_DAYS)
-                logger.info(f"[{name}] 上傳成功，狀態已更新，舊資料已清理。")
+                logger.info(f"[{name}] 上傳成功，狀態已更新，舊資料已清理")
                 total_success += count
             else:
-                logger.error(f"[{name}] 上傳失敗，等待下次排程重試。")
+                logger.error(f"[{name}] 上傳失敗，等待下次排程重試")
                 total_fail += count
                 
         session.close()
@@ -582,9 +582,9 @@ def main():
         if total_all > 0:
             logger.info(f"上傳完成：成功 {total_success} 筆，失敗 {total_fail} 筆，總共 {total_all} 筆")
         else:
-            logger.info("上傳完成：本次無新資料需要上傳。")
+            logger.info("上傳完成：本次無新資料需要上傳")
             
-        logger.info("本次排程任務結束。")
+        logger.info("本次排程任務結束")
 
     finally:
         # 釋放檔案鎖
@@ -610,7 +610,7 @@ if __name__ == '__main__':
     """
     try:
         main()
-        logger.info("排程執行結束。\n" + "-" * 40)
+        logger.info("排程執行結束\n" + "-" * 40)
     except Exception as e:
         # 捕捉所有未預期的錯誤，記錄詳細資訊
         logger.error(f"主程式執行時發生未預期的嚴重錯誤: {e}", exc_info=True)
