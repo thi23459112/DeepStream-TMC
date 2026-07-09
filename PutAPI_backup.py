@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 核心優化：
-1. [手動輪替] 程式啟動時自動檢查 Log 大小並搬移備份，維持 10MB 容量限制。
-2. [狀態追蹤] 引入 State File，這批全成功才推進狀態，斷線重連不遺失。
-3. [安全清理] 分批刪除舊資料，不卡死 AI 寫入。
-4. [防並行鎖] fcntl File Lock，防止排程重疊。
+1. [手動輪替] 程式啟動時自動檢查 Log 大小並搬移備份，維持 10MB 容量限制
+2. [狀態追蹤] 引入 State File，這批全成功才推進狀態，斷線重連不遺失
+3. [安全清理] 分批刪除舊資料，不卡死 AI 寫入
+4. [防並行鎖] fcntl File Lock，防止排程重疊
 """
 
 import os
@@ -193,7 +193,7 @@ def purge_history_data(db_files):
                 if deleted_count < 2000: break
                 time.sleep(0.05)
             if total_deleted > 0:
-                logger.info(f"[{name}] 首次部署清理：丟棄 {total_deleted} 筆歷史資料。")
+                logger.info(f"[{name}] 首次部署清理：丟棄 {total_deleted} 筆歷史資料")
         except Exception as e:
             logger.error(f"[{name}] 首次清理失敗: {e}")
         finally:
@@ -245,7 +245,7 @@ def main():
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except IOError:
-        logger.warning("偵測到另一個執行個體正在運行，本次結束。")
+        logger.warning("偵測到另一個執行個體正在運行，本次結束")
         lock_file.close() 
         return 
 
@@ -263,7 +263,7 @@ def main():
             for db_file in db_files:
                 state[os.path.basename(db_file)] = compute_default_since_str()
             save_state(state)
-            logger.info("首次部署清理完成，已初始化狀態檔。")
+            logger.info("首次部署清理完成，已初始化狀態檔")
 
         session = build_session()
         
@@ -294,17 +294,17 @@ def main():
                     else:
                         fail_count += 1
                         
-            logger.info(f"[{name}] 本批上傳結果：成功 {success_count} 筆，失敗 {fail_count} 筆。")
+            logger.info(f"[{name}] 本批上傳結果：成功 {success_count} 筆，失敗 {fail_count} 筆")
             
             # === 狀態推進邏輯 ===
-            # 為了確保狀態機正確，只有當這批資料「100% 全數成功」時，才推進狀態並清理 DB。
-            # 若有失敗，狀態不推進，下次排程會重傳 (PUT 具有冪等性，覆蓋重傳是安全的)。
+            # 為了確保狀態機正確，只有當這批資料「100% 全數成功」時，才推進狀態並清理 DB
+            # 若有失敗，狀態不推進，下次排程會重傳 (PUT 具有冪等性，覆蓋重傳是安全的)
             if fail_count == 0:
                 state[name] = max_time
                 cleanup_db(db_file, max_time, RETENTION_DAYS)
-                logger.info(f"[{name}] 全數上傳成功，狀態已推進，舊資料已清理。")
+                logger.info(f"[{name}] 全數上傳成功，狀態已推進，舊資料已清理")
             else:
-                logger.warning(f"[{name}] 存在失敗紀錄，狀態不推進，等待下次排程重傳。")
+                logger.warning(f"[{name}] 存在失敗紀錄，狀態不推進，等待下次排程重傳")
                 
             grand_total_success += success_count
             grand_total_fail += fail_count
@@ -317,9 +317,9 @@ def main():
         if total_all > 0:
             logger.info(f"最終統計：成功 {grand_total_success} 筆，失敗 {grand_total_fail} 筆，總共 {total_all} 筆")
         else:
-            logger.info("最終統計：本次無新資料需要上傳。")
+            logger.info("最終統計：本次無新資料需要上傳")
             
-        logger.info("本次排程任務結束。")
+        logger.info("本次排程任務結束")
 
     finally:
         fcntl.flock(lock_file, fcntl.LOCK_UN)
@@ -328,7 +328,7 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-        logger.info("排程執行結束。\n" + "-" * 40)
+        logger.info("排程執行結束\n" + "-" * 40)
     except Exception as e:
         logger.error(f"主程式執行時發生未預期的嚴重錯誤: {e}", exc_info=True)
     finally:
