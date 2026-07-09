@@ -267,9 +267,7 @@ def _build_save_branch_for_file(pipeline, pad_index, video_path, source_fps):
 
     parser = make_elm("h264parse", f"h264-parser-{i}")
 
-    muxer = make_elm("qtmux", f"muxer-{i}")
-    # ⭐ 新增：DTS 由 PTS 推導(ASC)，避免 qtmux 對缺失 DTS 過度敏感
-    muxer.set_property("dts-method", 1)
+    muxer = make_elm("matroskamux", f"muxer-{i}")
 
     filesink = make_elm("filesink", f"filesink-{i}")
     filesink.set_property("location", video_path)
@@ -331,8 +329,7 @@ def _build_save_branch_for_rtsp(pipeline, pad_index, video_path, source_fps):
             _safe_set(encoder, "tuning-info-id", 2)
 
     parser = make_elm("h264parse", f"h264-parser-{i}")
-    muxer = make_elm("qtmux", f"muxer-{i}")
-    muxer.set_property("dts-method", 1)
+    muxer = make_elm("matroskamux", f"muxer-{i}")
     filesink = make_elm("filesink", f"filesink-{i}")
     filesink.set_property("location", video_path)
     filesink.set_property("async", False)
