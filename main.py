@@ -295,13 +295,12 @@ def main():
     處理流程：
     1. 印追蹤器模式並（BoxMOT 模式）初始化 tracker instance
     2. 建立 GStreamer pipeline 與 streammux
-    3. 為每路 cam 建立 uridecodebin 來源
+    3. 為每路 cam 建立 nvurisrcbin 來源（RTSP 路啟用自動重連）
     4. 建立共用推論元件（preprocess / pgie / analytics）
     5. 依 TRACKER_MODE 條件式建立 nvtracker 與連結 pipeline 中段
     6. 條件式掛載對應的追蹤探針
     7. 建立 demux 並為每路 cam 組下游分支
-    8. 啟動 RTSP server（若有 cam 啟用推流）
-    9. 進入 GLib 主迴圈，等待 Q 鍵或 EOS 退出
+    8. 進入 GLib 主迴圈（RTSP 路啟動看門狗），等待 Q 鍵或 EOS 退出
     """
     global g_loop, g_pipeline, g_eos_triggered
 
